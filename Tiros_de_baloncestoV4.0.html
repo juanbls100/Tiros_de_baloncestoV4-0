@@ -1,0 +1,369 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, addDoc, query, orderBy, onSnapshot, serverTimestamp } from 'firebase/firestore';
+
+// Global variables provided by the Canvas environment
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? initialAuthToken : null;
+
+// Main App component
+function App() {
+  const [madeShots, setMadeShots] = useState(10); // State for shots made in current series, default to 10
+  const [shotRecords, setShotRecords] = useState([]); // State for all recorded series
+  const [totalMadeShots, setTotalMadeShots] = useState(0); // State for cumulative total made shots
+  const [seriesCount, setSeriesCount] = useState(0); // State for total number of series
+  const [db, setDb] = useState(null); // Firestore database instance
+  const [auth, setAuth] = useState(null); // Firebase Auth instance
+  const [userId, setUserId] = useState(null); // Current user ID
+  const [loading, setLoading] = useState(true); // Loading state for Firebase initialization and operations
+  const [activePage, setActivePage] = useState('registro'); // State for active page (Registro, Estadísticas, Detalles)
+  const [observations, setObservations] = useState(''); // State for observations text area
+  const [showConfirmationModal, setShowConfirmationModal] = useState(false); // State for confirmation modal visibility
+  const [confirmationMessage, setConfirmationMessage] = useState(''); // State for confirmation modal message
+  const [isListening, setIsListening] = useState(false); // State for microphone listening status
+
+  // Apps Script Web App URL for Google Sheets integration
+  const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxRPdsmc6yw_h_u_mkA0AKxSvYqUJ_I3EHW4MPpVYZxZdXVc5n_ZIJjlXcZwAepw2u8/exec';
+
+  // Initialize Firebase and set up authentication listener
+  useEffect(() => {
+    try {
+      const app = initializeApp(firebaseConfig);
+      const firestoreDb = getFirestore(app);
+      const firebaseAuth = getAuth(app);
+
+      setDb(firestoreDb);
+      setAuth(firebaseAuth);
+
+      // Listen for authentication state changes
+      const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+        if (user) {
+          // User is signed in
+          setUserId(user.uid);
+          setLoading(false);
+        } else {
+          // User is signed out or not yet signed in
+          try {
+            if (initialAuthToken) {
+              await signInWithCustomToken(firebaseAuth, initialAuthToken);
+            } else {
+              await signInAnonymously(firebaseAuth);
+            }
+          } catch (error) {
+            console.error("Error signing in:", error);
+            setLoading(false);
+          }
+        }
+      });
+
+      return () => unsubscribe(); // Cleanup auth listener on component unmount
+    } catch (error) {
+      console.error("Error initializing Firebase:", error);
+      setLoading(false);
+    }
+  }, []);
+
+  // Fetch shot records from Firestore when db and userId are available
+  useEffect(() => {
+    if (db && userId) {
+      // Define the collection path for the current user's private data
+      const userShotCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/basketball_shots`);
+      
+      // Create a query to order records by timestamp (though we will sort in memory)
+      const q = query(userShotCollectionRef);
+
+      // Set up a real-time listener for the shot records
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+        const records = [];
+        let currentTotalMadeShots = 0;
+        snapshot.forEach((doc) => {
+          const data = doc.data();
+          records.push({ id: doc.id, ...data });
+          currentTotalMadeShots += data.madeShots;
+        });
+
+        // Sort records by timestamp in ascending order for display
+        records.sort((a, b) => (a.timestamp?.toDate() || 0) - (b.timestamp?.toDate() || 0));
+
+        setShotRecords(records);
+        setTotalMadeShots(currentTotalMadeShots);
+        setSeriesCount(records.length);
+        setLoading(false);
+      }, (error) => {
+        console.error("Error fetching shot records:", error);
+        setLoading(false);
+      });
+
+      return () => unsubscribe(); // Cleanup snapshot listener on component unmount
+    }
+  }, [db, userId]); // Re-run when db or userId changes
+
+  // Handle dropdown selection change
+  const handleMadeShotsChange = (event) => {
+    setMadeShots(parseInt(event.target.value, 10));
+  };
+
+  // Handle registering a new series
+  const handleRegisterSeries = async () => {
+    if (db && userId) {
+      setLoading(true); // Set loading to true when starting the save operation
+      try {
+        // 1. Save to Firestore (existing code)
+        await addDoc(collection(db, `artifacts/${appId}/users/${userId}/basketball_shots`), {
+          madeShots: madeShots,
+          observations: observations, // Save observations to Firestore
+          timestamp: serverTimestamp(), // Firestore server timestamp
+        });
+
+        // 2. Send to Google Sheets via Apps Script
+        await fetch(APPS_SCRIPT_URL, {
+          method: 'POST',
+          mode: 'no-cors', // Important for cross-origin requests to Apps Script from the client
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            madeShots: madeShots,
+            observations: observations // Send observations to Apps Script
+          }),
+        });
+
+        // Determine confirmation message based on madeShots
+        let message = '';
+        if (madeShots >= 35) {
+          message = `¡Impresionante! Encestaste ${madeShots} tiros. ¡Sigue así!`;
+        } else if (madeShots >= 25) {
+          message = `¡Bien hecho! Encestaste ${madeShots} tiros. ¡Casi perfecto!`;
+        } else if (madeShots >= 15) {
+          message = `Nada mal, encestaste ${madeShots} tiros. ¡Con práctica mejorarás!`;
+        } else {
+          message = `Encestaste ${madeShots} tiros. ¡No te desanimes, a seguir practicando!`;
+        }
+        setConfirmationMessage(message);
+        setShowConfirmationModal(true);
+
+        setMadeShots(10); // Reset dropdown to 10 after registering
+        setObservations(''); // Clear observations after registering
+      } catch (e) {
+        console.error("Error registering data:", e);
+        setConfirmationMessage("Error al registrar la serie. Inténtalo de nuevo.");
+        setShowConfirmationModal(true);
+      } finally {
+        setLoading(false); // Set loading to false after the operation completes (success or failure)
+      }
+    } else {
+      console.warn("Firestore not initialized or user not authenticated.");
+    }
+  };
+
+  // Function to close the confirmation modal
+  const closeConfirmationModal = () => {
+    setShowConfirmationModal(false);
+    setConfirmationMessage('');
+  };
+
+  // Function to handle voice input
+  const handleVoiceInput = () => {
+    if (!('webkitSpeechRecognition' in window)) {
+      alert('Tu navegador no soporta la API de reconocimiento de voz. Por favor, usa Chrome.');
+      return;
+    }
+
+    const SpeechRecognition = window.webkitSpeechRecognition || window.SpeechRecognition;
+    const recognition = new SpeechRecognition();
+    recognition.continuous = false; // Stop after first result
+    recognition.lang = 'es-ES'; // Set language to Spanish
+
+    recognition.onstart = () => {
+      setIsListening(true);
+      console.log('Voice recognition started...');
+    };
+
+    recognition.onresult = (event) => {
+      const transcript = event.results[0][0].transcript;
+      setObservations(prevObs => prevObs + (prevObs ? ' ' : '') + transcript); // Append to existing observations
+      setIsListening(false);
+    };
+
+    recognition.onerror = (event) => {
+      setIsListening(false);
+      console.error('Speech recognition error:', event.error);
+      // You can display a more user-friendly message here if needed
+      if (event.error === 'not-allowed') {
+        alert('Permiso de micrófono denegado. Por favor, habilita el micrófono en la configuración de tu navegador.');
+      } else if (event.error === 'no-speech') {
+        // alert('No se detectó voz. Inténtalo de nuevo.');
+      } else {
+        // alert('Error en el reconocimiento de voz: ' + event.error);
+      }
+    };
+
+    recognition.onend = () => {
+      setIsListening(false);
+      console.log('Voice recognition ended.');
+    };
+
+    recognition.start();
+  };
+
+  if (loading) {
+    return (
+      <div className="fixed inset-0 flex flex-col items-center justify-center bg-black bg-opacity-70 text-white z-2000">
+        <div className="spinner border-8 border-gray-300 border-t-orange-500 rounded-full w-20 h-20 animate-spin mb-4"></div>
+        <p className="text-xl">Cargando...</p>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="min-h-screen flex flex-col items-center justify-center font-inter bg-cover bg-center bg-fixed"
+      style={{ backgroundImage: "url('https://admin.hedefliseyi.edu.az/storage/uploads/images/education/basketbol-1675075654.jpg')" }}
+    >
+      <div className="container bg-black bg-opacity-80 p-[30px] rounded-[15px] shadow-[0_10px_20px_rgba(0,0,0,0.6)] max-w-[900px] w-[95%] border-2 border-orange-600 my-[20px] box-border text-white text-center">
+        <header className="text-center mb-[30px] pb-[15px] border-b-2 border-orange-600">
+          <h1 className="text-[#ff6f00] text-[2.8em] font-normal mb-[10px] drop-shadow-lg leading-tight md:text-5xl">Tiros de baloncesto</h1>
+        </header>
+
+        <nav className="flex justify-center flex-wrap gap-[15px] mb-[25px] px-4">
+          <button
+            onClick={() => setActivePage('registro')}
+            className={`bg-blue-800 text-gray-100 py-[12px] px-[25px] rounded-[8px] cursor-pointer text-[1.1em] transition-all duration-300 shadow-[0_4px_8px_rgba(0,0,0,0.4)] hover:bg-blue-700 hover:translate-y-[-3px] hover:shadow-[0_6px_12px_rgba(0,0,0,0.6)] ${activePage === 'registro' ? 'border-2 border-white' : ''} flex-grow md:flex-grow-0 w-full sm:w-auto md:max-w-xs`}
+          >
+            Registro
+          </button>
+          <button
+            onClick={() => setActivePage('estadisticas')}
+            className={`bg-blue-800 text-gray-100 py-[12px] px-[25px] rounded-[8px] cursor-pointer text-[1.1em] transition-all duration-300 shadow-[0_4px_8px_rgba(0,0,0,0.4)] hover:bg-blue-700 hover:translate-y-[-3px] hover:shadow-[0_6px_12px_rgba(0,0,0,0.6)] ${activePage === 'estadisticas' ? 'border-2 border-white' : ''} flex-grow md:flex-grow-0 w-full sm:w-auto md:max-w-xs`}
+          >
+            Estadísticas
+          </button>
+          <button
+            onClick={() => setActivePage('detalles')}
+            className={`bg-blue-800 text-gray-100 py-[12px] px-[25px] rounded-[8px] cursor-pointer text-[1.1em] transition-all duration-300 shadow-[0_4px_8px_rgba(0,0,0,0.4)] hover:bg-blue-700 hover:translate-y-[-3px] hover:shadow-[0_6px_12px_rgba(0,0,0,0.6)] ${activePage === 'detalles' ? 'border-2 border-white' : ''} flex-grow md:flex-grow-0 w-full sm:w-auto md:max-w-xs`}
+          >
+            Detalles
+          </button>
+        </nav>
+
+        {/* Registro Page */}
+        <div id="home-page" className={`page ${activePage === 'registro' ? 'active block' : 'hidden'} animate-fadeIn text-center`}>
+          <label htmlFor="madeShots" className="block mb-6 text-[1.3em] text-blue-800 font-bold">
+            Tiros encestados en esta serie (de 50):
+          </label>
+          <select
+            id="madeShots"
+            value={madeShots}
+            onChange={handleMadeShotsChange}
+            className="p-[12px] px-[20px] rounded-[8px] border border-gray-600 bg-gray-900 text-gray-100 text-[1.2em] mb-6 w-full max-w-[250px] appearance-none bg-[url('data:image/svg+xml;charset=US-ASCII,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%22292.4%22%20height%3D%22292.4%22%3E%3Cpath%20fill%3D%22%23ecf0f1%22%20d%3D%22M287%2C146.2l-123.8%2C123.8L40%2C146.2C13.2%2C119.4%2C0%2C92.4%2C0%2C65.4C0%2C38.4%2C13.2%2C11.4%2C40%2C-15.4l106.2%2C106.2L287%2C-15.4C313.8%2C11.4%2C327%2C38.4%2C327%2C65.4C327%2C92.4%2C313.8%2C119.4%2C287%2C146.2z%22%2F%3E%3C%2Fsvg%3E')] bg-no-repeat bg-[right_15px_center] bg-[length:15px] cursor-pointer shadow-[inset_0_2px_5px_rgba(0,0,0,0.3)]"
+          >
+            {/* Generate options from 10 to 40 */}
+            {[...Array(31).keys()].map(i => (
+              <option key={10 + i} value={10 + i}>{10 + i}</option>
+            ))}
+          </select>
+
+          {/* Observations Text Area with Voice Input Button */}
+          <div className="flex items-center justify-center mb-6 w-full max-w-[400px] mx-auto">
+            <label htmlFor="observations" className="sr-only">
+              Observaciones:
+            </label>
+            <textarea
+              id="observations"
+              value={observations}
+              onChange={(e) => setObservations(e.target.value)}
+              className="p-[12px] px-[20px] rounded-l-[8px] border border-gray-600 bg-gray-900 text-gray-100 text-[1.2em] w-full h-24 resize-y shadow-[inset_0_2px_5px_rgba(0,0,0,0.3)] focus:outline-none focus:ring-2 focus:ring-blue-500"
+              placeholder="¿Cómo te sentiste? ¿Alguna observación? (Opcional)"
+            ></textarea>
+            <button
+              onClick={handleVoiceInput}
+              className={`py-[12px] px-[16px] rounded-r-[8px] text-white font-bold transition-all duration-300 shadow-[0_2px_5px_rgba(0,0,0,0.3)] h-24 flex items-center justify-center ${isListening ? 'bg-orange-600 hover:bg-orange-700 animate-pulse' : 'bg-blue-800 hover:bg-blue-700'}`}
+              title={isListening ? 'Escuchando...' : 'Dictar observaciones'}
+            >
+              {/* Basketball icon SVG */}
+              <svg className="w-8 h-8" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
+                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/>
+                <path d="M12 4c-2.47 0-4.48 1.51-5 3.5h10c-.52-1.99-2.53-3.5-5-3.5zM7 12c0-2.47 1.51-4.48 3.5-5H12c2.47 0 4.48 1.51 5 3.5H7z"/>
+                <path d="M12 20c2.47 0 4.48-1.51 5-3.5H7c.52 1.99 2.53 3.5 5 3.5zM17 12c0 2.47-1.51 4.48-3.5 5H12c-2.47 0-4.48-1.51-5-3.5h10z"/>
+              </svg>
+            </button>
+          </div>
+
+          <button
+            id="save-btn"
+            onClick={handleRegisterSeries}
+            className="bg-orange-600 text-white py-[8px] px-[16px] rounded-[8px] cursor-pointer text-[1em] font-bold transition-all duration-300 shadow-[0_6px_12px_rgba(0,0,0,0.5)] tracking-wide hover:bg-orange-700 hover:translate-y-[-4px] hover:shadow-[0_8px_16px_rgba(0,0,0,0.7)] mx-auto block max-w-[150px] mt-4"
+          >
+            Registrar Serie
+          </button>
+        </div>
+
+        {/* Estadísticas Page */}
+        <div id="stats-page" className={`page ${activePage === 'estadisticas' ? 'active block' : 'hidden'} animate-fadeIn`}>
+          <h2 className="text-blue-800 mt-[20px] mb-[15px] border-b border-gray-100 pb-[5px] text-[2em] text-center font-bold">Estadísticas Globales</h2>
+          <div className="bg-gray-900 p-[25px] rounded-[12px] mb-[20px] shadow-[inset_0_0_15px_rgba(0,0,0,0.4)] border border-gray-600">
+            <p className="text-[1.2em] leading-relaxed mb-[12px] text-gray-100">Series Registradas: <strong className="text-orange-600 font-bold">{seriesCount}</strong></p>
+            <p className="text-[1.2em] leading-relaxed mb-[12px] text-gray-100">Total Tiros Encestados: <strong className="text-orange-600 font-bold">{totalMadeShots}</strong></p>
+            <p className="text-[1.2em] leading-relaxed mb-[12px] text-gray-100">Total de Tiros: <strong className="text-orange-600 font-bold">{seriesCount * 50}</strong></p> {/* New: Total de Tiros */}
+            <p className="text-[1.2em] leading-relaxed mb-[12px] text-gray-100">
+              Porcentaje de Enceste: <strong className="text-orange-600 font-bold">
+                {seriesCount > 0 ? ((totalMadeShots / (seriesCount * 50)) * 100).toFixed(2) : '0.00'}%
+              </strong>
+            </p>
+          </div>
+        </div>
+
+        {/* Detalles Page */}
+        <div id="details-page" className={`page ${activePage === 'detalles' ? 'active block' : 'hidden'} animate-fadeIn`}>
+          <h2 className="text-blue-800 mt-[20px] mb-[15px] border-b border-gray-100 pb-[5px] text-[2em] text-center font-bold">Historial de Tiros</h2>
+          {shotRecords.length === 0 ? (
+            <p className="no-data text-center italic text-gray-400 mt-[40px] text-[1.1em] p-[15px] bg-black bg-opacity-60 rounded-[10px] border border-dashed border-gray-600">Aún no hay series registradas.</p>
+          ) : (
+            <ul className="list-none p-0 max-h-60 overflow-y-auto overflow-x-hidden custom-scrollbar">
+              {shotRecords.map((record, index) => (
+                <li
+                  key={record.id || index}
+                  className="bg-gray-700 p-[15px] px-[20px] rounded-[10px] mb-[10px] flex flex-col items-start border-l-[6px] border-blue-800 shadow-[0_2px_5px_rgba(0,0,0,0.3)] transition-transform duration-200 hover:translate-x-[5px]"
+                >
+                  <div className="flex justify-between w-full items-center mb-1">
+                    <span className="font-bold text-gray-100">Serie {index + 1}: {record.madeShots} encestados</span>
+                    {record.timestamp && (
+                      <span className="date-time text-[0.95em] text-gray-400 text-right flex-shrink-0">
+                        {new Date(record.timestamp.toDate()).toLocaleDateString()} - {new Date(record.timestamp.toDate()).toLocaleTimeString()}
+                      </span>
+                    )}
+                  </div>
+                  {record.observations && (
+                    <p className="text-sm text-gray-300 mt-1 italic w-full text-left">
+                      Observaciones: {record.observations}
+                    </p>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
+
+      {/* Confirmation Modal */}
+      {showConfirmationModal && (
+        <div className="fixed inset-0 flex items-center justify-center bg-black bg-opacity-70 text-white z-3000">
+          <div className="bg-gray-800 p-8 rounded-lg shadow-xl border-2 border-orange-600 text-center max-w-sm mx-auto">
+            <h3 className="text-2xl font-bold mb-4 text-orange-500">Resultado de la Serie</h3>
+            <p className="text-lg mb-6">{confirmationMessage}</p>
+            <button
+              onClick={closeConfirmationModal}
+              className="bg-blue-800 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg shadow-md transition-all duration-300"
+            >
+              Aceptar
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default App;
